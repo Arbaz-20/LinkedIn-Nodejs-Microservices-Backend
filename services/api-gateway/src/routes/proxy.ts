@@ -36,8 +36,10 @@ export function registerProxies(app: Express): void {
       createProxyMiddleware({
         target,
         changeOrigin: true,
-        // Preserve the full /api/... path on the upstream.
-        pathRewrite: undefined,
+        // Express strips the mount path (e.g. "/api/users") before the proxy
+        // sees the request, leaving req.url as "/me". Restore the prefix so the
+        // upstream receives the full "/api/users/me" path it routes on.
+        pathRewrite: (p) => `${path}${p}`,
         on: {
           proxyReq: fixRequestBody,
           error: (err, _req, res) => {

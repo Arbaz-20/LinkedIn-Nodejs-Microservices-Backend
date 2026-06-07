@@ -36,7 +36,9 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./init-databases.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "5432:5432"
+      # Host 5544 → container 5432: a native Postgres may already own host 5432.
+      # Container networking still uses 5432.
+      - "5544:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U linkedin"]
       interval: 5s
@@ -51,7 +53,9 @@ services:
       RABBITMQ_DEFAULT_USER: linkedin
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
     ports:
-      - "5672:5672"
+      # Host 5673 → container 5672: host port 5672 is inside a Windows reserved
+      # exclusion range on some dev machines. Container networking still uses 5672.
+      - "5800:5672"
       - "15672:15672"
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
@@ -266,7 +270,9 @@ services:
       MINIO_USE_SSL: "false"
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
-      MEDIA_BUCKET: uploads
+      MINIO_BUCKET: uploads
+      # Client-reachable base URL for stored objects (browsers can't resolve "minio")
+      MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-http://localhost:9000}
 
   job-service:
     <<: *service-defaults

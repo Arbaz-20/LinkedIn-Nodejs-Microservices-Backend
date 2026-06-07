@@ -1,6 +1,8 @@
 # LinkedIn Clone — Microservices Backend Architecture Plan
 
-**Stack:** TypeScript · Node.js · Express 4 · Prisma ORM · PostgreSQL · Redis · RabbitMQ · JWT · Docker · GitHub Actions
+**Stack:** TypeScript · Node.js · Express 4 · Sequelize 6 (ORM) · sequelize-cli (migrations) · PostgreSQL · Redis · RabbitMQ · JWT · Docker · GitHub Actions
+
+> **Implementation note:** This document was originally drafted around Prisma + Turborepo/pnpm. The implemented codebase instead uses **Sequelize 6** with a **repository pattern**, **npm workspaces** (not Turborepo), and a custom `scripts/dev.js` orchestrator. The sections below reflect what is actually built.
 
 ---
 
@@ -20,18 +22,20 @@ linkedin-clone/
 │   ├── media-service/        # Upload, resize, serve images/video
 │   └── job-service/          # Job listings, applications, saved jobs
 ├── packages/
-│   └── shared/               # DTOs, constants, RabbitMQ helpers, logger
+│   └── shared/               # errors, http envelopes, constants, RabbitMQ/Redis helpers, logger, middleware
 ├── infra/
 │   ├── docker-compose.yml
-│   ├── docker-compose.prod.yml
+│   ├── init-databases.sql    # creates one Postgres database per service
 │   └── nginx/
 │       └── nginx.conf
+├── scripts/
+│   └── dev.js                # dev orchestrator (watch shared + run all services)
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml
 │       └── deploy.yml
-├── turbo.json
-└── package.json              # Turborepo root
+├── tsconfig.base.json
+└── package.json              # npm workspaces root
 ```
 
 ### Service Responsibilities
@@ -57,28 +61,36 @@ linkedin-clone/
 packages/shared/
 ├── src/
 │   ├── constants/
-│   │   ├── queues.ts          # RabbitMQ queue/exchange names
-│   │   └── events.ts          # Event type enums
-│   ├── dto/
-│   │   ├── user.dto.ts
-│   │   ├── post.dto.ts
-│   │   ├── notification.dto.ts
+│   │   ├── queues.ts          # RabbitMQ exchange/queue/DLX names + types
+│   │   ├── events.ts          # Routing keys + EventEnvelope shape
+│   │   └── index.ts
+│   ├── errors/
+│   │   ├── AppError.ts        # AppError + typed subclasses (BadRequest, NotFound, ...)
+│   │   └── index.ts
+│   ├── http/
+│   │   ├── respond.ts         # ok() / created() / noContent() envelopes
 │   │   └── index.ts
 │   ├── middleware/
-│   │   ├── errorHandler.ts    # Global Express error handler
+│   │   ├── errorHandler.ts    # Global error handler + notFoundHandler
 │   │   ├── validate.ts        # Zod validation middleware
-│   │   └── rateLimiter.ts     # Token-bucket via Redis
+│   │   ├── requireUser.ts     # requireUser / optionalUser / requireRole
+│   │   ├── rateLimiter.ts     # Token-bucket via Redis
+│   │   └── index.ts
 │   ├── rabbitmq/
 │   │   ├── connection.ts      # Channel pool manager
-│   │   ├── publisher.ts       # Publish with retry + confirm
-│   │   └── consumer.ts        # Consumer with DLQ + manual ack
+│   │   ├── publisher.ts       # publishEvent() with confirm + retry
+│   │   ├── consumer.ts        # registerConsumer() with DLQ + retry/backoff
+│   │   └── index.ts
 │   ├── logger/
-│   │   └── index.ts           # Pino structured logger
+│   │   └── index.ts           # Pino structured logger (createLogger)
 │   ├── redis/
-│   │   └── client.ts          # ioredis singleton
-│   └── utils/
-│       ├── asyncHandler.ts    # Wraps async route handlers
-│       └── pagination.ts      # Cursor & offset helpers
+│   │   ├── client.ts          # ioredis singleton (getRedis/closeRedis)
+│   │   └── index.ts
+│   ├── utils/
+│   │   ├── asyncHandler.ts    # Wraps async route handlers
+│   │   ├── pagination.ts      # Cursor & offset helpers
+│   │   └── index.ts
+│   └── index.ts               # Barrel — consumers import from '@linkedin-clone/shared'
 ├── package.json
 └── tsconfig.json
 ```
@@ -160,524 +172,199 @@ export const QUEUES = {
 
 ---
 
-## 3. Database Schemas (Prisma)
+## 3. Data Models (Sequelize)
+
+Each service owns its database and defines models with Sequelize 6 (`Model<InferAttributes, InferCreationAttributes>` + `Model.init`). Columns map to `snake_case` via the global `define: { underscored: true }` plus explicit `field:` overrides. Schema changes ship as **sequelize-cli migrations** under each service's `migrations/` directory (run with `npm run db:migrate -w @linkedin-clone/<svc>`); models are never auto-synced in production. Each model uses a UUID primary key (`DataTypes.UUID` / `DataTypes.UUIDV4`), and migrations default ids to `gen_random_uuid()`.
+
+The field maps below describe the implemented tables (Sequelize attribute → column type, defaults, indexes). Enums are Postgres enums (`DataTypes.ENUM`) surfaced in TS as string unions.
 
 ### 3.1 Auth Service — `auth_db`
 
-```prisma
-// services/auth-service/prisma/schema.prisma
-generator client {
-  provider = "prisma-client-js"
+```ts
+// services/auth-service/src/models/User.ts  → table "users"
+{
+  id:            UUID  pk default uuidv4
+  email:         STRING unique
+  passwordHash:  STRING                 // password_hash
+  isVerified:    BOOLEAN default false  // is_verified
+  verifyToken:   STRING?                // verify_token
+  resetToken:    STRING?                // reset_token
+  resetExpiry:   DATE?                  // reset_expiry
+  oauthProvider: STRING?                // oauth_provider
+  oauthId:       STRING?                // oauth_id
+  role:          ENUM('USER','ADMIN','RECRUITER') default 'USER'
+  lastLoginAt:   DATE?                  // last_login_at
+  createdAt / updatedAt: DATE
 }
+// unique (oauth_provider, oauth_id)
 
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+// services/auth-service/src/models/RefreshToken.ts  → table "refresh_tokens"
+{
+  id:         UUID pk
+  token:      STRING unique
+  userId:     UUID   // user_id  — FK users.id ON DELETE CASCADE
+  deviceInfo: STRING?  // device_info
+  expiresAt:  DATE     // expires_at
+  createdAt:  DATE
 }
-
-model User {
-  id             String    @id @default(uuid())
-  email          String    @unique
-  passwordHash   String    @map("password_hash")
-  isVerified     Boolean   @default(false) @map("is_verified")
-  verifyToken    String?   @map("verify_token")
-  resetToken     String?   @map("reset_token")
-  resetExpiry    DateTime? @map("reset_expiry")
-  oauthProvider  String?   @map("oauth_provider")
-  oauthId        String?   @map("oauth_id")
-  role           Role      @default(USER)
-  lastLoginAt    DateTime? @map("last_login_at")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
-
-  refreshTokens  RefreshToken[]
-
-  @@unique([oauthProvider, oauthId])
-  @@map("users")
-}
-
-model RefreshToken {
-  id          String   @id @default(uuid())
-  token       String   @unique
-  userId      String   @map("user_id")
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  deviceInfo  String?  @map("device_info")
-  expiresAt   DateTime @map("expires_at")
-  createdAt   DateTime @default(now()) @map("created_at")
-
-  @@index([userId])
-  @@map("refresh_tokens")
-}
-
-enum Role {
-  USER
-  ADMIN
-  RECRUITER
-}
+// index (user_id)   ·   User hasMany RefreshToken
 ```
 
 ### 3.2 User Service — `user_db`
 
-```prisma
-// services/user-service/prisma/schema.prisma
-model Profile {
-  id            String   @id @default(uuid()) // Same as auth user ID
-  firstName     String   @map("first_name")
-  lastName      String   @map("last_name")
-  headline      String?
-  summary       String?  @db.Text
-  avatarUrl     String?  @map("avatar_url")
-  bannerUrl     String?  @map("banner_url")
-  location      String?
-  website       String?
-  industry      String?
-  isOpenToWork  Boolean  @default(false) @map("is_open_to_work")
-  profileViews  Int      @default(0) @map("profile_views")
-  createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+```ts
+// Profile → "profiles"  (id === auth user id)
+{ id:UUID pk, firstName, lastName, headline?, summary?(TEXT), avatarUrl?,
+  bannerUrl?, location?, website?, industry?, isOpenToWork:BOOL default false,
+  profileViews:INT default 0, createdAt, updatedAt }
 
-  experiences   Experience[]
-  educations    Education[]
-  skills        ProfileSkill[]
-  certifications Certification[]
+// Experience → "experiences"   index(profile_id)   belongsTo Profile (CASCADE)
+{ id:UUID pk, profileId, title, company, companyLogo?, location?,
+  startDate:DATE, endDate?:DATE, isCurrent:BOOL default false, description?(TEXT), createdAt }
 
-  @@map("profiles")
-}
+// Education → "educations"   index(profile_id)
+{ id:UUID pk, profileId, school, degree?, fieldOfStudy?, startYear:INT,
+  endYear?:INT, grade?, activities?(TEXT), createdAt }
 
-model Experience {
-  id          String    @id @default(uuid())
-  profileId   String    @map("profile_id")
-  profile     Profile   @relation(fields: [profileId], references: [id], onDelete: Cascade)
-  title       String
-  company     String
-  companyLogo String?   @map("company_logo")
-  location    String?
-  startDate   DateTime  @map("start_date")
-  endDate     DateTime? @map("end_date")
-  isCurrent   Boolean   @default(false) @map("is_current")
-  description String?   @db.Text
-  createdAt   DateTime  @default(now()) @map("created_at")
+// Skill → "skills"
+{ id:UUID pk, name:STRING unique, category? }
 
-  @@index([profileId])
-  @@map("experiences")
-}
+// ProfileSkill → "profile_skills"  (composite pk profile_id+skill_id)
+{ profileId, skillId, endorsements:INT default 0 }
 
-model Education {
-  id           String    @id @default(uuid())
-  profileId    String    @map("profile_id")
-  profile      Profile   @relation(fields: [profileId], references: [id], onDelete: Cascade)
-  school       String
-  degree       String?
-  fieldOfStudy String?   @map("field_of_study")
-  startYear    Int       @map("start_year")
-  endYear      Int?      @map("end_year")
-  grade        String?
-  activities   String?   @db.Text
-  createdAt    DateTime  @default(now()) @map("created_at")
+// SkillEndorsement → "skill_endorsements"  (who endorsed whom for which skill;
+//   prevents double-counting endorsements — see migration 2)
+{ id:UUID pk, profileId, skillId, endorserId, createdAt }   // unique(profile_id,skill_id,endorser_id)
 
-  @@index([profileId])
-  @@map("educations")
-}
-
-model Skill {
-  id       String         @id @default(uuid())
-  name     String         @unique
-  category String?
-
-  profiles ProfileSkill[]
-  @@map("skills")
-}
-
-model ProfileSkill {
-  profileId      String  @map("profile_id")
-  skillId        String  @map("skill_id")
-  profile        Profile @relation(fields: [profileId], references: [id], onDelete: Cascade)
-  skill          Skill   @relation(fields: [skillId], references: [id], onDelete: Cascade)
-  endorsements   Int     @default(0)
-
-  @@id([profileId, skillId])
-  @@map("profile_skills")
-}
-
-model Certification {
-  id             String    @id @default(uuid())
-  profileId      String    @map("profile_id")
-  profile        Profile   @relation(fields: [profileId], references: [id], onDelete: Cascade)
-  name           String
-  issuingOrg     String    @map("issuing_org")
-  issueDate      DateTime  @map("issue_date")
-  expirationDate DateTime? @map("expiration_date")
-  credentialId   String?   @map("credential_id")
-  credentialUrl  String?   @map("credential_url")
-
-  @@index([profileId])
-  @@map("certifications")
-}
+// Certification → "certifications"   index(profile_id)
+{ id:UUID pk, profileId, name, issuingOrg, issueDate:DATE,
+  expirationDate?:DATE, credentialId?, credentialUrl? }
 ```
+Profile `hasMany` Experience / Education / ProfileSkill / Certification (all `ON DELETE CASCADE`); Skill `hasMany` ProfileSkill.
 
 ### 3.3 Connection Service — `connection_db`
 
-```prisma
-// services/connection-service/prisma/schema.prisma
-model Connection {
-  id          String           @id @default(uuid())
-  requesterId String          @map("requester_id")
-  addresseeId String          @map("addressee_id")
-  status      ConnectionStatus @default(PENDING)
-  note        String?
-  createdAt   DateTime         @default(now()) @map("created_at")
-  updatedAt   DateTime         @updatedAt @map("updated_at")
+```ts
+// Connection → "connections"
+{ id:UUID pk, requesterId, addresseeId,
+  status:ENUM('PENDING','ACCEPTED','REJECTED','WITHDRAWN') default 'PENDING',
+  note?, createdAt, updatedAt }
+// unique(requester_id,addressee_id) · index(addressee_id,status) · index(requester_id,status)
 
-  @@unique([requesterId, addresseeId])
-  @@index([addresseeId, status])
-  @@index([requesterId, status])
-  @@map("connections")
-}
+// Follow → "follows"
+{ id:UUID pk, followerId, followingId, createdAt }
+// unique(follower_id,following_id) · index(following_id)
 
-model Follow {
-  id          String   @id @default(uuid())
-  followerId  String   @map("follower_id")
-  followingId String   @map("following_id")
-  createdAt   DateTime @default(now()) @map("created_at")
-
-  @@unique([followerId, followingId])
-  @@index([followingId])
-  @@map("follows")
-}
-
-model Block {
-  id         String   @id @default(uuid())
-  blockerId  String   @map("blocker_id")
-  blockedId  String   @map("blocked_id")
-  createdAt  DateTime @default(now()) @map("created_at")
-
-  @@unique([blockerId, blockedId])
-  @@map("blocks")
-}
-
-enum ConnectionStatus {
-  PENDING
-  ACCEPTED
-  REJECTED
-  WITHDRAWN
-}
+// Block → "blocks"
+{ id:UUID pk, blockerId, blockedId, createdAt }
+// unique(blocker_id,blocked_id) · index(blocked_id)
 ```
+The three aggregates are independent (no cross-table associations).
 
 ### 3.4 Post Service — `post_db`
 
-```prisma
-// services/post-service/prisma/schema.prisma
-model Post {
-  id          String     @id @default(uuid())
-  authorId    String     @map("author_id")
-  content     String     @db.Text
-  mediaUrls   String[]   @map("media_urls")
-  postType    PostType   @default(POST) @map("post_type")
-  visibility  Visibility @default(PUBLIC)
-  isEdited    Boolean    @default(false) @map("is_edited")
-  likesCount  Int        @default(0) @map("likes_count")
-  commentsCount Int      @default(0) @map("comments_count")
-  sharesCount Int        @default(0) @map("shares_count")
-  createdAt   DateTime   @default(now()) @map("created_at")
-  updatedAt   DateTime   @updatedAt @map("updated_at")
-  deletedAt   DateTime?  @map("deleted_at")
+```ts
+// Post → "posts"
+{ id:UUID pk, authorId, content:TEXT, mediaUrls:ARRAY(STRING) default [],
+  postType:ENUM('POST','ARTICLE','POLL','SHARE','CELEBRATION') default 'POST',
+  visibility:ENUM('PUBLIC','CONNECTIONS','PRIVATE') default 'PUBLIC',
+  isEdited:BOOL default false, likesCount/commentsCount/sharesCount:INT default 0,
+  createdAt, updatedAt, deletedAt?:DATE }   // soft delete
+// index(author_id, created_at DESC) · index(created_at DESC)
 
-  comments    Comment[]
-  reactions   Reaction[]
-  hashtags    PostHashtag[]
+// Comment → "comments"   (self-referential threads)
+{ id:UUID pk, postId, authorId, parentId?, content:TEXT, likesCount:INT default 0,
+  createdAt, updatedAt }
+// index(post_id, created_at) · index(parent_id) · Comment hasMany Comment ("Replies")
 
-  @@index([authorId, createdAt(sort: Desc)])
-  @@index([createdAt(sort: Desc)])
-  @@map("posts")
-}
+// Reaction → "reactions"
+{ id:UUID pk, postId, userId,
+  type:ENUM('LIKE','CELEBRATE','SUPPORT','LOVE','INSIGHTFUL','FUNNY') default 'LIKE' }
+// unique(post_id,user_id)
 
-model Comment {
-  id        String    @id @default(uuid())
-  postId    String    @map("post_id")
-  post      Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
-  authorId  String    @map("author_id")
-  parentId  String?   @map("parent_id")
-  parent    Comment?  @relation("Replies", fields: [parentId], references: [id])
-  replies   Comment[] @relation("Replies")
-  content   String    @db.Text
-  likesCount Int      @default(0) @map("likes_count")
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime  @updatedAt @map("updated_at")
-
-  @@index([postId, createdAt])
-  @@index([parentId])
-  @@map("comments")
-}
-
-model Reaction {
-  id       String       @id @default(uuid())
-  postId   String       @map("post_id")
-  post     Post         @relation(fields: [postId], references: [id], onDelete: Cascade)
-  userId   String       @map("user_id")
-  type     ReactionType @default(LIKE)
-
-  @@unique([postId, userId])
-  @@map("reactions")
-}
-
-model Hashtag {
-  id    String        @id @default(uuid())
-  name  String        @unique
-  posts PostHashtag[]
-
-  @@map("hashtags")
-}
-
-model PostHashtag {
-  postId    String  @map("post_id")
-  hashtagId String  @map("hashtag_id")
-  post      Post    @relation(fields: [postId], references: [id], onDelete: Cascade)
-  hashtag   Hashtag @relation(fields: [hashtagId], references: [id], onDelete: Cascade)
-
-  @@id([postId, hashtagId])
-  @@map("post_hashtags")
-}
-
-enum PostType {
-  POST
-  ARTICLE
-  POLL
-  SHARE
-  CELEBRATION
-}
-
-enum Visibility {
-  PUBLIC
-  CONNECTIONS
-  PRIVATE
-}
-
-enum ReactionType {
-  LIKE
-  CELEBRATE
-  SUPPORT
-  LOVE
-  INSIGHTFUL
-  FUNNY
-}
+// Hashtag → "hashtags"  { id:UUID pk, name:STRING unique }
+// PostHashtag → "post_hashtags"  (composite pk post_id+hashtag_id)
 ```
+Post `hasMany` Comment / Reaction / PostHashtag (`CASCADE`); Hashtag `hasMany` PostHashtag.
 
 ### 3.5 Messaging Service — `messaging_db`
 
-```prisma
-// services/messaging-service/prisma/schema.prisma
-model Conversation {
-  id           String    @id @default(uuid())
-  isGroup      Boolean   @default(false) @map("is_group")
-  groupName    String?   @map("group_name")
-  groupAvatar  String?   @map("group_avatar")
-  lastMessageAt DateTime? @map("last_message_at")
-  createdAt    DateTime  @default(now()) @map("created_at")
+```ts
+// Conversation → "conversations"
+{ id:UUID pk, isGroup:BOOL default false, groupName?, groupAvatar?,
+  lastMessageAt?:DATE, createdAt }       // index(last_message_at DESC)
 
-  participants Participant[]
-  messages     Message[]
+// Participant → "participants"   (timestamps:false)
+{ id:UUID pk, conversationId, userId, joinedAt:DATE default now,
+  lastReadAt?:DATE, isMuted:BOOL default false }
+// unique(conversation_id,user_id) · index(user_id)
 
-  @@index([lastMessageAt(sort: Desc)])
-  @@map("conversations")
-}
-
-model Participant {
-  id              String       @id @default(uuid())
-  conversationId  String       @map("conversation_id")
-  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  userId          String       @map("user_id")
-  joinedAt        DateTime     @default(now()) @map("joined_at")
-  lastReadAt      DateTime?    @map("last_read_at")
-  isMuted         Boolean      @default(false) @map("is_muted")
-
-  @@unique([conversationId, userId])
-  @@index([userId])
-  @@map("participants")
-}
-
-model Message {
-  id              String       @id @default(uuid())
-  conversationId  String       @map("conversation_id")
-  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  senderId        String       @map("sender_id")
-  content         String?      @db.Text
-  mediaUrl        String?      @map("media_url")
-  messageType     MessageType  @default(TEXT) @map("message_type")
-  isEdited        Boolean      @default(false) @map("is_edited")
-  deletedAt       DateTime?    @map("deleted_at")
-  createdAt       DateTime     @default(now()) @map("created_at")
-
-  @@index([conversationId, createdAt(sort: Desc)])
-  @@map("messages")
-}
-
-enum MessageType {
-  TEXT
-  IMAGE
-  FILE
-  SYSTEM
-}
+// Message → "messages"
+{ id:UUID pk, conversationId, senderId, content?:TEXT, mediaUrl?,
+  messageType:ENUM('TEXT','IMAGE','FILE','SYSTEM') default 'TEXT',
+  isEdited:BOOL default false, deletedAt?:DATE, createdAt }
+// index(conversation_id, created_at DESC)
 ```
+Conversation `hasMany` Participant / Message (`CASCADE`).
 
 ### 3.6 Notification Service — `notification_db`
 
-```prisma
-// services/notification-service/prisma/schema.prisma
-model Notification {
-  id          String           @id @default(uuid())
-  recipientId String           @map("recipient_id")
-  actorId     String?          @map("actor_id")
-  type        NotificationType
-  entityType  String?          @map("entity_type")
-  entityId    String?          @map("entity_id")
-  message     String
-  isRead      Boolean          @default(false) @map("is_read")
-  readAt      DateTime?        @map("read_at")
-  metadata    Json?
-  createdAt   DateTime         @default(now()) @map("created_at")
+```ts
+// Notification → "notifications"   (updatedAt:false)
+{ id:UUID pk, recipientId, actorId?,
+  type:ENUM('CONNECTION_REQUEST','CONNECTION_ACCEPTED','POST_LIKE','POST_COMMENT',
+            'COMMENT_REPLY','ENDORSEMENT','PROFILE_VIEW','JOB_RECOMMENDATION',
+            'MESSAGE_RECEIVED','MENTION'),
+  entityType?, entityId?, message:STRING, isRead:BOOL default false, readAt?:DATE,
+  metadata?:JSONB, createdAt }
+// index(recipient_id, is_read, created_at DESC)
 
-  @@index([recipientId, isRead, createdAt(sort: Desc)])
-  @@map("notifications")
-}
-
-model NotificationPreference {
-  id          String  @id @default(uuid())
-  userId      String  @unique @map("user_id")
-  inApp       Boolean @default(true) @map("in_app")
-  email       Boolean @default(true)
-  push        Boolean @default(true)
-  connections Boolean @default(true)
-  messages    Boolean @default(true)
-  posts       Boolean @default(true)
-  jobs        Boolean @default(true)
-
-  @@map("notification_preferences")
-}
-
-enum NotificationType {
-  CONNECTION_REQUEST
-  CONNECTION_ACCEPTED
-  POST_LIKE
-  POST_COMMENT
-  COMMENT_REPLY
-  ENDORSEMENT
-  PROFILE_VIEW
-  JOB_RECOMMENDATION
-  MESSAGE_RECEIVED
-  MENTION
-}
+// NotificationPreference → "notification_preferences"   (timestamps:false)
+{ id:UUID pk, userId:UUID unique, inApp:BOOL default true, email:BOOL default true,
+  push:BOOL default true, connections:BOOL default true, messages:BOOL default true,
+  posts:BOOL default true, jobs:BOOL default true }
 ```
 
 ### 3.7 Job Service — `job_db`
 
-```prisma
-// services/job-service/prisma/schema.prisma
-model Company {
-  id          String   @id @default(uuid())
-  name        String
-  slug        String   @unique
-  logoUrl     String?  @map("logo_url")
-  bannerUrl   String?  @map("banner_url")
-  website     String?
-  industry    String?
-  size        String?
-  description String?  @db.Text
-  location    String?
-  foundedYear Int?     @map("founded_year")
-  adminIds    String[] @map("admin_ids")
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+```ts
+// Company → "companies"
+{ id:UUID pk, name, slug:STRING unique, logoUrl?, bannerUrl?, website?, industry?,
+  size?, description?(TEXT), location?, foundedYear?:INT,
+  adminIds:ARRAY(UUID) default [], createdAt, updatedAt }
 
-  jobs        Job[]
+// Job → "jobs"
+{ id:UUID pk, companyId, posterId, title, description:TEXT, location?,
+  locationType:ENUM('ONSITE','REMOTE','HYBRID') default 'ONSITE',
+  employmentType:ENUM('FULL_TIME','PART_TIME','CONTRACT','INTERNSHIP','FREELANCE'),
+  experienceLevel:ENUM('ENTRY','ASSOCIATE','MID_SENIOR','DIRECTOR','EXECUTIVE'),
+  salaryMin?:INT, salaryMax?:INT, salaryCurrency? default 'USD',
+  skills:ARRAY(STRING) default [], isActive:BOOL default true,
+  applicantsCount:INT default 0, createdAt, updatedAt }
+// index(company_id) · index(is_active, created_at DESC)
 
-  @@map("companies")
-}
+// Application → "applications"
+{ id:UUID pk, jobId, applicantId, resumeUrl?, coverLetter?(TEXT),
+  status:ENUM('SUBMITTED','REVIEWED','SHORTLISTED','REJECTED','HIRED','WITHDRAWN')
+         default 'SUBMITTED', createdAt, updatedAt }
+// unique(job_id,applicant_id) · index(applicant_id)
 
-model Job {
-  id              String          @id @default(uuid())
-  companyId       String          @map("company_id")
-  company         Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  posterId        String          @map("poster_id")
-  title           String
-  description     String          @db.Text
-  location        String?
-  locationType    LocationType    @default(ONSITE) @map("location_type")
-  employmentType  EmploymentType  @map("employment_type")
-  experienceLevel ExperienceLevel @map("experience_level")
-  salaryMin       Int?            @map("salary_min")
-  salaryMax       Int?            @map("salary_max")
-  salaryCurrency  String?         @default("USD") @map("salary_currency")
-  skills          String[]
-  isActive        Boolean         @default(true) @map("is_active")
-  applicantsCount Int             @default(0) @map("applicants_count")
-  createdAt       DateTime        @default(now()) @map("created_at")
-  updatedAt       DateTime        @updatedAt @map("updated_at")
-
-  applications    Application[]
-  savedBy         SavedJob[]
-
-  @@index([companyId])
-  @@index([isActive, createdAt(sort: Desc)])
-  @@map("jobs")
-}
-
-model Application {
-  id          String            @id @default(uuid())
-  jobId       String            @map("job_id")
-  job         Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  applicantId String            @map("applicant_id")
-  resumeUrl   String?           @map("resume_url")
-  coverLetter String?           @map("cover_letter") @db.Text
-  status      ApplicationStatus @default(SUBMITTED)
-  createdAt   DateTime          @default(now()) @map("created_at")
-  updatedAt   DateTime          @updatedAt @map("updated_at")
-
-  @@unique([jobId, applicantId])
-  @@index([applicantId])
-  @@map("applications")
-}
-
-model SavedJob {
-  userId    String   @map("user_id")
-  jobId     String   @map("job_id")
-  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  createdAt DateTime @default(now()) @map("created_at")
-
-  @@id([userId, jobId])
-  @@map("saved_jobs")
-}
-
-enum LocationType   { ONSITE  REMOTE  HYBRID }
-enum EmploymentType { FULL_TIME  PART_TIME  CONTRACT  INTERNSHIP  FREELANCE }
-enum ExperienceLevel { ENTRY  ASSOCIATE  MID_SENIOR  DIRECTOR  EXECUTIVE }
-enum ApplicationStatus { SUBMITTED  REVIEWED  SHORTLISTED  REJECTED  HIRED  WITHDRAWN }
+// SavedJob → "saved_jobs"   (composite pk user_id+job_id)
+{ userId, jobId, createdAt }
 ```
+Company `hasMany` Job (`CASCADE`); Job `hasMany` Application / SavedJob (`CASCADE`).
 
 ### 3.8 Media Service — `media_db`
 
-```prisma
-// services/media-service/prisma/schema.prisma
-model Media {
-  id          String    @id @default(uuid())
-  uploaderId  String    @map("uploader_id")
-  fileName    String    @map("file_name")
-  mimeType    String    @map("mime_type")
-  size        Int
-  url         String
-  thumbnailUrl String?  @map("thumbnail_url")
-  bucket      String    @default("uploads")
-  key         String    @unique
-  width       Int?
-  height      Int?
-  status      MediaStatus @default(PROCESSING)
-  createdAt   DateTime  @default(now()) @map("created_at")
-
-  @@index([uploaderId])
-  @@map("media")
-}
-
-enum MediaStatus { PROCESSING  READY  FAILED }
+```ts
+// Media → "media"   (metadata; bytes live in MinIO/S3)
+{ id:UUID pk, uploaderId, fileName, mimeType, size:INT, url, thumbnailUrl?,
+  bucket:STRING default 'uploads', key:STRING unique, width?:INT, height?:INT,
+  status:ENUM('PROCESSING','READY','FAILED') default 'PROCESSING', createdAt }
+// index(uploader_id)
 ```
+
+> **Search Service** has no relational database — it indexes documents into **Elasticsearch** (`users`, `posts`, `jobs`, `companies` indices) populated by RabbitMQ consumers.
 
 ---
 
@@ -689,64 +376,77 @@ Every service follows identical structure:
 services/<name>-service/
 ├── src/
 │   ├── config/
-│   │   └── index.ts           # env parsing via envalid
+│   │   └── index.ts           # env parsing + validation via zod
+│   ├── models/
+│   │   ├── <Entity>.ts        # Sequelize Model.init definitions
+│   │   └── index.ts           # associations wired here
+│   ├── repositories/
+│   │   └── <domain>.repository.ts  # all DB access (Sequelize queries)
+│   ├── services/
+│   │   └── <domain>.service.ts      # business logic, calls repositories + publishers
 │   ├── controllers/
 │   │   └── <domain>.controller.ts
-│   ├── services/
-│   │   └── <domain>.service.ts
 │   ├── routes/
-│   │   └── <domain>.routes.ts
+│   │   ├── <domain>.routes.ts
+│   │   └── index.ts
+│   ├── validators/
+│   │   └── <domain>.validators.ts   # zod request schemas
 │   ├── events/
 │   │   ├── publishers.ts      # outgoing RabbitMQ events
-│   │   └── consumers.ts       # incoming RabbitMQ event handlers
-│   ├── middleware/
-│   │   └── auth.ts            # JWT extraction (injected userId)
-│   ├── prisma/
-│   │   └── client.ts          # PrismaClient singleton
+│   │   └── consumers.ts       # incoming RabbitMQ handlers (only where needed)
+│   ├── db/
+│   │   └── sequelize.ts       # Sequelize singleton + assertDbConnection()
 │   ├── app.ts                 # Express app (routes, middleware)
-│   └── server.ts              # Listen + RabbitMQ init + graceful shutdown
-├── prisma/
-│   ├── schema.prisma
-│   └── migrations/
+│   └── server.ts              # Listen + DB + RabbitMQ init + graceful shutdown
+├── migrations/                # sequelize-cli migration files
+├── config/
+│   └── config.js              # sequelize-cli datasource (reads DATABASE_URL)
+├── .sequelizerc               # points sequelize-cli at config/ + migrations/
 ├── Dockerfile
 ├── .env.example
 ├── tsconfig.json
 └── package.json
 ```
 
+> Identity is **not** parsed from JWTs in services. The gateway verifies the token and injects `x-user-id` / `x-user-role`; the shared `requireUser` middleware reads those headers into `req.userId` / `req.userRole`. Search-service omits `models/`, `db/`, `migrations/`, `config/`, `.sequelizerc` (Elasticsearch instead of Postgres); media-service additionally has a `storage/minio.ts` client.
+
 ### Boilerplate: `server.ts`
 
 ```typescript
+import { rabbit, getRedis, closeRedis, createLogger } from '@linkedin-clone/shared';
 import { app } from './app';
 import { config } from './config';
-import { rabbit } from '@linkedin-clone/shared/rabbitmq';
-import { prisma } from './prisma/client';
-import { registerConsumers } from './events/consumers';
-import { logger } from '@linkedin-clone/shared/logger';
+import { sequelize, assertDbConnection } from './db/sequelize';
+import { registerConsumers } from './events/consumers'; // only in services that consume
 
-async function bootstrap() {
+const logger = createLogger(config.SERVICE_NAME);
+
+async function bootstrap(): Promise<void> {
+  await assertDbConnection();
   await rabbit.connect(config.RABBITMQ_URL);
-  await registerConsumers();
+  await registerConsumers();               // omit in services without consumers
+  if (config.REDIS_URL) getRedis(config.REDIS_URL);
   logger.info('RabbitMQ connected, consumers registered');
 
   const server = app.listen(config.PORT, () => {
-    logger.info(`${config.SERVICE_NAME} running on :${config.PORT}`);
+    logger.info(`${config.SERVICE_NAME} listening on :${config.PORT}`);
   });
 
-  const shutdown = async (signal: string) => {
+  const shutdown = async (signal: string): Promise<void> => {
     logger.info(`${signal} received — shutting down`);
     server.close();
     await rabbit.close();
-    await prisma.$disconnect();
+    await closeRedis();
+    await sequelize.close();
     process.exit(0);
   };
 
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
 }
 
 bootstrap().catch((err) => {
-  logger.fatal(err, 'Fatal startup error');
+  logger.fatal(err, 'fatal startup error');
   process.exit(1);
 });
 ```
@@ -757,16 +457,23 @@ bootstrap().catch((err) => {
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import { errorHandler } from '@linkedin-clone/shared/middleware';
+import { errorHandler, notFoundHandler } from '@linkedin-clone/shared';
+import { config } from './config';
 import { router } from './routes';
 
 export const app = express();
 
 app.use(helmet());
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use('/health', (_, res) => res.json({ status: 'ok' }));
+app.use(cors({ origin: config.CLIENT_URL, credentials: true }));
+app.use(express.json({ limit: '1mb' }));
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', service: config.SERVICE_NAME });
+});
+
 app.use('/api', router);
+
+app.use(notFoundHandler);
 app.use(errorHandler);
 ```
 
@@ -1081,86 +788,78 @@ PUT    /companies/:id          Update company
 
 ## 9. Feed Algorithm (Simplified)
 
+The feed service fetches the viewer's social graph from connection-service over HTTP (degrading to just the viewer's own posts if that call fails), then keyset-paginates posts by `createdAt`. DB access lives in the repository; the shared `buildCursorPage` helper splits the `limit + 1` row and computes the next cursor.
+
 ```typescript
 // services/post-service/src/services/feed.service.ts
-async function getFeed(userId: string, cursor?: string, limit = 20) {
-  // 1. Get user's connection IDs (HTTP call to connection-service)
-  const connectionIds = await getConnectionIds(userId);
-
-  // 2. Get user's followed IDs
-  const followingIds = await getFollowingIds(userId);
+public getFeed = async (userId: string, cursor?: string, limit = config.FEED_PAGE_SIZE): Promise<FeedPage> => {
+  // 1–2. Connection + following ids (HTTP → connection-service)
+  const [connectionIds, followingIds] = await Promise.all([
+    connectionClient.getConnectionIds(userId),
+    connectionClient.getFollowingIds(userId),
+  ]);
 
   const authorIds = [...new Set([...connectionIds, ...followingIds, userId])];
 
-  // 3. Fetch posts from those authors, sorted by recency + engagement score
-  const posts = await prisma.post.findMany({
-    where: {
-      authorId: { in: authorIds },
-      deletedAt: null,
-      ...(cursor ? { createdAt: { lt: new Date(cursor) } } : {}),
-      OR: [
-        { visibility: 'PUBLIC' },
-        { visibility: 'CONNECTIONS', authorId: { in: connectionIds } },
-        { authorId: userId },
-      ],
-    },
-    orderBy: { createdAt: 'desc' },
-    take: limit + 1,  // fetch one extra for cursor
-  });
+  // 3. Repository runs the keyset query (Sequelize) honoring visibility:
+  //    deletedAt IS NULL, createdAt < cursor, and
+  //    (visibility = PUBLIC) OR (visibility = CONNECTIONS AND author ∈ connectionIds) OR (author = self)
+  const rows = await postRepository.feedPage({ authorIds, connectionIds, viewerId: userId, cursor, limit });
 
-  const hasMore = posts.length > limit;
-  const results = hasMore ? posts.slice(0, -1) : posts;
-  const nextCursor = hasMore ? results[results.length - 1].createdAt.toISOString() : null;
+  const { items, nextCursor, hasMore } = buildCursorPage(rows, limit, (p) => p.createdAt.toISOString());
+  return { posts: items, nextCursor, hasMore };
+};
+```
 
-  return { posts: results, nextCursor, hasMore };
-}
+```typescript
+// services/post-service/src/repositories/post.repository.ts — the keyset query
+return Post.findAll({
+  where: {
+    authorId: { [Op.in]: authorIds },
+    deletedAt: null,
+    ...(cursor ? { createdAt: { [Op.lt]: new Date(cursor) } } : {}),
+    [Op.or]: [
+      { visibility: 'PUBLIC' },
+      { visibility: 'CONNECTIONS', authorId: { [Op.in]: connectionIds } },
+      { authorId: viewerId },
+    ],
+  },
+  order: [['createdAt', 'DESC']],
+  limit: limit + 1, // one extra row drives the next cursor
+});
 ```
 
 ---
 
 ## 10. Dockerfile (Shared Pattern)
 
+Two-stage build using **npm workspaces** (the shared package is built first, then the service). Postgres-backed services also copy their migration assets so migrations can run against the database.
+
 ```dockerfile
-# services/<any>-service/Dockerfile
-FROM node:20-alpine AS base
-RUN corepack enable
-
-# --- Dependencies ---
-FROM base AS deps
+# syntax=docker/dockerfile:1
+# services/<name>-service/Dockerfile
+FROM node:20-alpine AS build
 WORKDIR /app
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json ./
-COPY packages/shared/package.json ./packages/shared/
-COPY services/<name>-service/package.json ./services/<name>-service/
-RUN pnpm install --frozen-lockfile
-
-# --- Build ---
-FROM base AS build
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY --from=deps /app/packages/shared/node_modules ./packages/shared/node_modules
-COPY --from=deps /app/services/<name>-service/node_modules ./services/<name>-service/node_modules
+COPY package.json package-lock.json tsconfig.base.json ./
 COPY packages/shared ./packages/shared
 COPY services/<name>-service ./services/<name>-service
+RUN npm install --no-audit --no-fund
+RUN npm run build -w @linkedin-clone/shared
+RUN npm run build -w @linkedin-clone/<name>-service
 
-# Build shared first, then service
-RUN pnpm --filter @linkedin-clone/shared run build
-RUN pnpm --filter @linkedin-clone/<name>-service run build
-
-# Prisma generate
-RUN cd services/<name>-service && npx prisma generate
-
-# --- Production ---
-FROM base AS production
+FROM node:20-alpine AS production
 WORKDIR /app
 ENV NODE_ENV=production
-
+COPY package.json package-lock.json ./
+COPY packages/shared/package.json ./packages/shared/
+COPY services/<name>-service/package.json ./services/<name>-service/
+RUN npm install --omit=dev --no-audit --no-fund
 COPY --from=build /app/packages/shared/dist ./packages/shared/dist
-COPY --from=build /app/packages/shared/package.json ./packages/shared/
 COPY --from=build /app/services/<name>-service/dist ./services/<name>-service/dist
-COPY --from=build /app/services/<name>-service/prisma ./services/<name>-service/prisma
-COPY --from=build /app/services/<name>-service/package.json ./services/<name>-service/
-COPY --from=build /app/services/<name>-service/node_modules ./services/<name>-service/node_modules
-
+# Migration assets (Postgres services only) — run `npm run db:migrate -w @linkedin-clone/<name>-service`
+COPY services/<name>-service/.sequelizerc ./services/<name>-service/
+COPY services/<name>-service/config ./services/<name>-service/config
+COPY services/<name>-service/migrations ./services/<name>-service/migrations
 EXPOSE 300X
 CMD ["node", "services/<name>-service/dist/server.js"]
 ```
@@ -1489,20 +1188,21 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with: { version: 9 }
       - uses: actions/setup-node@v4
-        with: { node-version: 20, cache: pnpm }
-      - run: pnpm install --frozen-lockfile
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+
+      - name: Build shared package
+        run: npm run build:shared
 
       - name: Lint
-        run: pnpm turbo lint
+        run: npm run lint
 
       - name: Type Check
-        run: pnpm turbo typecheck
+        run: npm run typecheck
 
       - name: Unit Tests
-        run: pnpm turbo test -- --coverage
+        run: npm test
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test_db
           REDIS_URL: redis://localhost:6379
@@ -1659,26 +1359,26 @@ CLIENT_URL=http://localhost:5173
 
 ---
 
-## 14. Prisma Migration Workflow
+## 14. Migration Workflow (sequelize-cli)
 
 ```bash
-# Per-service migration commands (run from service directory)
-cd services/auth-service
+# Per-service commands. Run from the repo root via workspaces, e.g.:
 
-# Create migration after schema change
-npx prisma migrate dev --name add_oauth_fields
+# Create a migration after a model change (writes to services/<svc>/migrations/)
+npx sequelize-cli migration:generate --name add_oauth_fields \
+  --options-path services/auth-service/.sequelizerc
 
-# Apply in production
-npx prisma migrate deploy
+# Apply pending migrations (dev or prod) — DATABASE_URL is read from the env
+npm run db:migrate -w @linkedin-clone/auth-service
 
-# Reset database (dev only)
-npx prisma migrate reset
+# Roll back the last migration
+npm run db:migrate:undo -w @linkedin-clone/auth-service
 
-# Generate client after schema change
-npx prisma generate
+# Apply migrations for every service that defines db:migrate
+npm run db:migrate            # root — fans out across workspaces
 ```
 
-Each service has its own `prisma/` directory, own migration history, and its own database. They are completely independent.
+Each Postgres service has its own `migrations/` history, its own `config/config.js` datasource (reads `DATABASE_URL`), and its own database — they are completely independent. `config/config.js` enables Postgres TLS in production via the `DB_SSL` / `DB_SSL_NO_VERIFY` env vars. Search-service has no migrations (Elasticsearch indices are asserted at boot by `ensureIndices()`).
 
 ---
 
@@ -1699,31 +1399,34 @@ Each service has its own `prisma/` directory, own migration history, and its own
 
 ## 16. Project Scripts (Root `package.json`)
 
+The monorepo uses **npm workspaces** (`packages/*`, `services/*`) — no Turborepo/pnpm. `dev` runs a custom orchestrator (`scripts/dev.js`) that builds `shared` in watch mode and starts every service with a `dev` script concurrently (services are discovered dynamically, so new ones are picked up automatically).
+
 ```json
 {
   "name": "linkedin-clone",
   "private": true,
+  "workspaces": ["packages/*", "services/*"],
   "scripts": {
-    "dev": "turbo dev",
-    "build": "turbo build",
-    "lint": "turbo lint",
-    "typecheck": "turbo typecheck",
-    "test": "turbo test",
-    "test:e2e": "turbo test:e2e",
-    "db:migrate": "turbo db:migrate",
-    "db:generate": "turbo db:generate",
-    "db:seed": "turbo db:seed",
+    "build": "npm run build --workspaces --if-present",
+    "build:shared": "npm run build -w @linkedin-clone/shared",
+    "dev": "node scripts/dev.js",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "db:migrate": "npm run db:migrate --workspaces --if-present",
+    "db:seed": "npm run db:seed --workspaces --if-present",
     "docker:up": "docker compose -f infra/docker-compose.yml up -d",
     "docker:down": "docker compose -f infra/docker-compose.yml down",
     "docker:logs": "docker compose -f infra/docker-compose.yml logs -f",
     "docker:build": "docker compose -f infra/docker-compose.yml build",
-    "clean": "turbo clean && rm -rf node_modules"
+    "infra:up": "docker compose -f infra/docker-compose.yml up -d postgres rabbitmq redis elasticsearch minio"
   },
   "devDependencies": {
-    "turbo": "^2.0.0",
-    "typescript": "^5.4.0"
+    "@types/node": "^20.12.0",
+    "concurrently": "^8.2.2",
+    "typescript": "^5.4.5"
   },
-  "packageManager": "pnpm@9.0.0"
+  "engines": { "node": ">=20" }
 }
 ```
 
@@ -1732,24 +1435,24 @@ Each service has its own `prisma/` directory, own migration history, and its own
 ## 17. Development Workflow
 
 ```bash
-# 1. Clone and install
+# 1. Clone and install (npm workspaces)
 git clone <repo> && cd linkedin-clone
-pnpm install
+npm install
 
-# 2. Start infrastructure
-docker compose -f infra/docker-compose.yml up -d postgres rabbitmq redis elasticsearch minio
+# 2. Start infrastructure (postgres, rabbitmq, redis, elasticsearch, minio)
+npm run infra:up
 
-# 3. Run migrations for all services
-pnpm db:migrate
+# 3. Build the shared package (services import its compiled dist)
+npm run build:shared
 
-# 4. Seed databases
-pnpm db:seed
+# 4. Run migrations for all Postgres services
+npm run db:migrate
 
-# 5. Start all services in dev mode (hot-reload)
-pnpm dev
+# 5. Start all services in dev mode (shared in watch + every service, hot-reload)
+npm run dev
 
 # 6. Access
-#    API:            http://localhost:80/api
+#    API:            http://localhost:80/api   (via NGINX → api-gateway)
 #    RabbitMQ UI:    http://localhost:15672
 #    MinIO Console:  http://localhost:9001
 #    Elasticsearch:  http://localhost:9200

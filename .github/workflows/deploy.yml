@@ -1,0 +1,71 @@
+name: Deploy
+
+# Runs after CI succeeds on main. Pulls the freshly-built images on the target
+# host, applies pending DB migrations, then performs a rolling, one-at-a-time
+# restart of each service.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to server over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: IMAGE_TAG
+          script: |
+            set -euo pipefail
+            cd /opt/linkedin-clone
+            git pull origin main
+
+            export IMAGE_PREFIX="ghcr.io/${{ github.repository_owner }}/linkedin-clone"
+            export IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
+
+            COMPOSE="docker compose -f infra/docker-compose.yml -f infra/docker-compose.prod.yml"
+
+            # Log in to GHCR so private images can be pulled
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+            # Ensure infrastructure is up and healthy first
+            $COMPOSE up -d postgres rabbitmq redis elasticsearch minio
+
+            # Pull the new application images
+            $COMPOSE pull \
+              api-gateway auth-service user-service connection-service post-service \
+              messaging-service notification-service search-service media-service job-service
+
+            # Apply pending migrations for every Postgres-backed service
+            for svc in auth-service user-service connection-service post-service \
+                       messaging-service notification-service media-service job-service; do
+              $COMPOSE run --rm --no-deps "$svc" \
+                npm run db:migrate -w "@linkedin-clone/$svc"
+            done
+
+            # Rolling restart — one service at a time, with a health window
+            SERVICES=(
+              api-gateway auth-service user-service
+              connection-service post-service messaging-service
+              notification-service search-service media-service
+              job-service
+            )
+            for svc in "${SERVICES[@]}"; do
+              $COMPOSE up -d --no-deps "$svc"
+              sleep 10
+            done
+
+            # Restart the edge proxy and clean up dangling images
+            $COMPOSE up -d nginx
+            docker image prune -f

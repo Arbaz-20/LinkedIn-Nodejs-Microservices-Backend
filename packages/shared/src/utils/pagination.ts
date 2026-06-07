@@ -24,6 +24,8 @@ export interface OffsetPageMeta {
   total: number;
   totalPages: number;
   hasMore: boolean;
+  /** Index signature so this satisfies the response `meta` (Record<string, unknown>). */
+  [key: string]: unknown;
 }
 
 export function buildOffsetMeta(
